@@ -1,32 +1,43 @@
-from flask import Flask, request, jsonify
-from flask.helpers import send_file
+from flask import Flask, request, jsonify, send_file
 import numpy as np
 import onnxruntime
-
 import cv2
 import json
+import os
+import sys
 
-app = Flask(__name__,
-            static_url_path='/', 
-            static_folder='web')
+app = Flask(__name__, static_url_path='/', static_folder='web')
 
-ort_session = onnxruntime.InferenceSession("efficientnet-lite4-11.onnx")
+# === Modellpfad ermitteln ===
+script_dir = os.path.dirname(os.path.abspath(__file__))
+model_filename = sys.argv[1] if len(sys.argv) > 1 else "efficientnet-lite4-11.onnx"
+model_path = os.path.join(script_dir, model_filename)
 
-# load the labels text file
-labels = json.load(open("labels_map.txt", "r"))
+if not os.path.isfile(model_path):
+    raise FileNotFoundError(f"❌ Model file not found: {model_path}")
+print(f"⚙️ Using model: {model_path}")
 
-# set image file dimensions to 224x224 by resizing and cropping image from center
+# === ONNX Modell laden ===
+ort_session = onnxruntime.InferenceSession(model_path)
+
+# === Labels laden ===
+labels_path = os.path.join(script_dir, "labels_map.txt")
+if not os.path.isfile(labels_path):
+    raise FileNotFoundError(f"❌ Labels file not found: {labels_path}")
+
+with open(labels_path, "r") as f:
+    labels = json.load(f)
+
+# === Bildvorverarbeitung ===
 def pre_process_edgetpu(img, dims):
     output_height, output_width, _ = dims
-    img = resize_with_aspectratio(img, output_height, output_width, inter_pol=cv2.INTER_LINEAR)
+    img = resize_with_aspectratio(img, output_height, output_width)
     img = center_crop(img, output_height, output_width)
     img = np.asarray(img, dtype='float32')
-    # converts jpg pixel value from [0 - 255] to float array [-1.0 - 1.0]
     img -= [127.0, 127.0, 127.0]
     img /= [128.0, 128.0, 128.0]
     return img
 
-# resize the image with a proportional scale
 def resize_with_aspectratio(img, out_height, out_width, scale=87.5, inter_pol=cv2.INTER_LINEAR):
     height, width, _ = img.shape
     new_height = int(100. * out_height / scale)
@@ -37,48 +48,35 @@ def resize_with_aspectratio(img, out_height, out_width, scale=87.5, inter_pol=cv
     else:
         h = new_height
         w = int(new_width * width / height)
-    img = cv2.resize(img, (w, h), interpolation=inter_pol)
-    return img
+    return cv2.resize(img, (w, h), interpolation=inter_pol)
 
-# crop the image around the center based on given height and width
 def center_crop(img, out_height, out_width):
     height, width, _ = img.shape
     left = int((width - out_width) / 2)
     right = int((width + out_width) / 2)
     top = int((height - out_height) / 2)
     bottom = int((height + out_height) / 2)
-    img = img[top:bottom, left:right]
-    return img
+    return img[top:bottom, left:right]
 
+# === Web-Endpunkte ===
 @app.route("/")
 def indexPage():
-    # Haven't used the secure way to send files yet
-    return send_file("web/index.html")    
+    return send_file("web/index.html")
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-
-    # read the image
     content = request.files.get('0', '').read()
-
-    # build numpy array from uploaded data
-    img = cv2.imdecode(np.fromstring(content, np.uint8), cv2.IMREAD_UNCHANGED)
-
-    # pre-process, see https://github.com/onnx/models/tree/master/vision/classification/efficientnet-lite4
+    img = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_UNCHANGED)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # pre-process the image like mobilenet and resize it to 224x224
     img = pre_process_edgetpu(img, (224, 224, 3))
-
-    # create a batch of 1 (that batch size is buned into the saved_model)
     img_batch = np.expand_dims(img, axis=0)
 
-    # run inference
     results = ort_session.run(["Softmax:0"], {"images:0": img_batch})[0]
-    result = reversed(results[0].argsort()[-5:])
+    top5_indices = reversed(results[0].argsort()[-5:])
+    result_list = [{"class": labels[str(i)], "value": float(results[0][i])} for i in top5_indices]
 
-    for r in result:
-        result_list = [{"class": labels[str(r)], "value": float(results[0][r])} for r in result]
+    return jsonify(result_list)
 
-    # Return the result as JSON
-    return jsonify(result_list)    
+# === App starten ===
+if __name__ == "__main__":
+    app.run(debug=True)
